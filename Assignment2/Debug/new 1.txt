@@ -1,0 +1,36 @@
+//.obj-loader psuedocode
+
+class LOADER
+{
+private:
+	//List of meshes goes in here, along with other stuff
+	vector<MESH> meshlist;
+public:
+	//Constructor, Destructor, etc..
+	HRESULT LoadNewMesh
+	{
+	//loading 
+	MESH newmesh = MESH();
+	filepointer fp;
+	while fp != EOF //repeat loop until end of file is reached;
+	
+	}
+}
+
+class MESH
+{
+private:
+//This is where the unique id of the mesh and all the lists(vectors) of its different  components are kept.
+	int id;
+	vector<VERTEX> v;
+	vector<TEXCOORDS> uv;
+	vector<NORMAL> vn;
+	vector<string> face;
+	//Additional features like ambience, diffuse, alpha etc.
+
+public:
+	MESH;
+	~MESH;
+	getid();
+	
+}
