@@ -1,0 +1,562 @@
+#include <windows.h>
+#include <d3d11.h>
+#include <d3dcompiler.h>
+#include <DirectXMath.h>
+#include "bth_image.h"
+#include <crtdbg.h>      //For checking memory leaks
+#include <time.h>        //Time
+
+//
+#pragma comment (lib, "d3d11.lib")
+#pragma comment (lib, "d3dcompiler.lib")
+
+//Definitions
+#define VERTEXCOUNT 6
+#define PI 3.141592f
+#define HEIGHT 480.0f
+#define WIDTH 640.0f
+#define CAM_POS { 0.0f, 0.0f, -2.0f, 1.0f }
+
+using namespace DirectX; //Don't want to use DirectX:: in front of every variable 
+
+//===============================================================================
+// Global pointers for the context
+//===============================================================================
+IDXGISwapChain* gSwapChain = nullptr;
+ID3D11Device* gDevice = nullptr;
+ID3D11DeviceContext* gDeviceContext = nullptr;
+ID3D11RenderTargetView* gBackbufferRTV = nullptr;
+//Global pointers for the Vshader
+ID3D11Buffer* gVertexBuffer = nullptr;
+ID3D11InputLayout* gVertexLayout = nullptr;
+ID3D11VertexShader* gVertexShader = nullptr;
+//Global pointers for the Fshader
+ID3D11PixelShader* gPixelShader = nullptr;
+//Global pointers for the Gshader
+ID3D11GeometryShader* gGeometryShader = nullptr;
+//Textures
+ID3D11Texture2D *gTexture = nullptr;
+ID3D11ShaderResourceView * gTexView = nullptr;
+ID3D11SamplerState* gSamplerState = nullptr;
+//Z-buffer
+ID3D11Texture2D* gDepthStencilBuffer = nullptr;
+ID3D11DepthStencilView * gDepthStencilView = nullptr;
+//Constant Buffer pointer
+ID3D11Buffer* gCBuffer = nullptr;
+
+//
+ 
+//===============================================================================
+// Structs & global variables
+//===============================================================================
+//WVP matrices
+struct Matrices {
+	XMFLOAT4X4	world;
+	XMFLOAT4X4  view;
+	XMFLOAT4X4	project;
+}; 
+//Define a triangle with uv-coords
+struct TriangleVertex{
+	float x, y, z;
+	float u, v;
+};
+
+Matrices wvp; //For WVP matrix storage
+float rot = 0.0f; //Rotation variable
+//===============================================================================
+//Declaring all functions to order them easier
+//===============================================================================
+HWND InitWindow(HINSTANCE hInstance); //Setting up window
+LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
+void SetViewport(); //Set up viewport
+HRESULT CreateDirect3DContext(HWND wndHandle);//Setting up Direct3D
+void CreateQuadData(); //Creating quads from static data
+void CreateShaders();  //Creating Vertex, Fragment and Pixel shaders
+void CreateTexture();  //Creating texture from data
+void CreateMatrices(); //Filling WVP matrices with necessary data
+void CreateConstantBuffer(); //Creating CBuffer to pass CPU information to GeoShader
+void Render();
+//Helper functions
+void ReleaseBuffers();
+void Spin();
+//===============================================================================
+//Function definitions below this point
+//===============================================================================
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmdShow) //Main
+{
+	_CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF); //Memory leaks
+	MSG msg = { 0 };
+	HWND wndHandle = InitWindow(hInstance); //1. Create window
+
+	if (wndHandle)
+	{
+		CreateDirect3DContext(wndHandle); //2. Create and connect Swap chain, Device and Device Context
+		
+		SetViewport(); //3. Set up context viewport
+
+		CreateShaders(); //4. Create vertex, fragment and geometry shaders
+
+		CreateQuadData(); //5. Define triangle vertices, create vertex buffer and input layout from these
+
+		CreateMatrices(); //6. Create World, View  and Projection Matrices.
+
+		CreateConstantBuffer(); //7. Create constant buffer.
+
+		CreateTexture(); //8. Initialise texture, sampler and depth stencil buffer.
+
+		ShowWindow(wndHandle, nCmdShow); //Display window
+
+		while (WM_QUIT != msg.message)
+		{
+			if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
+			{
+				TranslateMessage(&msg);
+				DispatchMessage(&msg);
+			}
+			else
+			{
+				Render(); //9. Render to window
+				gSwapChain->Present(0, 0); //10. Switch front- och back-buffers
+			}
+		}
+		//When program is done rendering
+		ReleaseBuffers(); //Release all buffers and pointers
+		DestroyWindow(wndHandle); //Destroy main window
+	}
+
+	return (int)msg.wParam;
+}
+
+HWND InitWindow(HINSTANCE hInstance) //Initialize Win32 window
+{
+	WNDCLASSEX wcex = { 0 };
+	wcex.cbSize = sizeof(WNDCLASSEX);
+	wcex.style = CS_HREDRAW | CS_VREDRAW;
+	wcex.lpfnWndProc = WndProc;
+	wcex.hInstance = hInstance;
+	wcex.lpszClassName = L"Assignment_2";
+	if (!RegisterClassEx(&wcex))
+		return false;
+
+	RECT rc = { 0, 0, (int)WIDTH, (int)HEIGHT};
+	AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+
+	HWND handle = CreateWindow(
+		L"Assignment_2",
+		L"Assignment 2",
+		WS_OVERLAPPEDWINDOW,
+		CW_USEDEFAULT,
+		CW_USEDEFAULT,
+		rc.right - rc.left,
+		rc.bottom - rc.top,
+		nullptr,
+		nullptr,
+		hInstance,
+		nullptr);
+
+	return handle;
+}
+
+LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+	switch (message)
+	{
+	case WM_DESTROY:
+		PostQuitMessage(0);
+		break;
+	}
+
+	return DefWindowProc(hWnd, message, wParam, lParam);
+}
+
+void SetViewport()//Setting up DirectX viewport for context
+{
+	D3D11_VIEWPORT vp;
+	vp.Width = WIDTH;
+	vp.Height = HEIGHT;
+	vp.MinDepth = 0.0f;
+	vp.MaxDepth = 1.0f;
+	vp.TopLeftX = 0;
+	vp.TopLeftY = 0;
+	gDeviceContext->RSSetViewports(1, &vp);
+}
+
+//
+HRESULT CreateDirect3DContext(HWND wndHandle)
+{
+	// Create a struct to hold information about the swap chain
+	DXGI_SWAP_CHAIN_DESC swapcdesc;
+	// Making sure the struct is empty before we use it (don't want any random junk in there).
+	ZeroMemory(&swapcdesc, sizeof(DXGI_SWAP_CHAIN_DESC));
+
+	// Fill the swap chain description struct
+	swapcdesc.BufferCount = 1;                                    // one back buffer
+	swapcdesc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;     // Use 32-bit color
+	swapcdesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;      // How swap chain is to be used
+	swapcdesc.OutputWindow = wndHandle;                           // The window to be used
+	swapcdesc.SampleDesc.Count = 4;                               // How many multisamples
+	swapcdesc.Windowed = TRUE;                                    // Windowed/full-screen mode
+
+	// Create a device, device context and swap chain using the information in the scd struct
+	HRESULT hr = D3D11CreateDeviceAndSwapChain(
+		NULL, //No adapter
+		D3D_DRIVER_TYPE_HARDWARE, //Driver for the purposes of rendering and hardware acceleration
+		NULL, //HMODULE is NULL because we're using a hardware driver, not software.
+		NULL, //No Flags
+		NULL, //No pointers to feature levels
+		NULL, //No feature levels
+		D3D11_SDK_VERSION,
+		&swapcdesc,
+		&gSwapChain,
+		&gDevice,
+		NULL,
+		&gDeviceContext);
+
+	if (SUCCEEDED(hr))
+	{
+		// Get the address of the back buffer
+		ID3D11Texture2D* pBackBuffer = nullptr;
+		gSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)&pBackBuffer);
+
+		// Use the back buffer address to create the render target
+		gDevice->CreateRenderTargetView(pBackBuffer, NULL, &gBackbufferRTV);
+		pBackBuffer->Release();
+
+		// Set the render target as the back buffer
+		gDeviceContext->OMSetRenderTargets(1, &gBackbufferRTV, gDepthStencilView);
+	}
+	return hr;
+}
+
+void CreateConstantBuffer() //Constant buffer to supply matrices to the GeoShader
+{
+	//Create a description of the buffer
+	D3D11_BUFFER_DESC CBuffer;
+	CBuffer.Usage = D3D11_USAGE_DYNAMIC; //Dynamic because the CPU will write to it
+	CBuffer.ByteWidth = sizeof(Matrices);//Size will be 3 4x4float matrices
+	CBuffer.BindFlags = D3D11_BIND_CONSTANT_BUFFER; 
+	CBuffer.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE; //
+	CBuffer.MiscFlags = 0; //No additional flags
+	CBuffer.StructureByteStride = 0; 
+
+	//Checking if the creation failed for any reason
+	HRESULT hr = 0;
+	hr = gDevice->CreateBuffer(&CBuffer, nullptr, &gCBuffer);
+	if (FAILED(hr))
+		exit(-1);
+}
+
+void CreateTexture()
+{
+	//Texture Description
+	D3D11_TEXTURE2D_DESC texDesc;
+	
+	ZeroMemory(&texDesc, sizeof(texDesc)); //Clear memory before usage
+	texDesc.Width = BTH_IMAGE_WIDTH; //How wide is the image (in texels)
+	texDesc.Height = BTH_IMAGE_HEIGHT; //How tall is the image (texels)
+	texDesc.MipLevels = texDesc.ArraySize = 1;
+	texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; //32 bit colo
+	texDesc.SampleDesc.Count = 1; //
+	texDesc.SampleDesc.Quality = 0; //
+	texDesc.Usage = D3D11_USAGE_DEFAULT; //Will read from and write to GPU, no CPU required
+	texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE; //
+	texDesc.MiscFlags = 0; //
+	texDesc.CPUAccessFlags = 0; //
+
+	//Create the texture from raw data (float*), BTH_IMAGE_DATA[] in bth_image.h
+	D3D11_SUBRESOURCE_DATA texData;
+	ZeroMemory(&texData, sizeof(texData));
+	texData.pSysMem = (void*)BTH_IMAGE_DATA;
+	texData.SysMemPitch = BTH_IMAGE_WIDTH * 4 * sizeof(char);
+	texData.SysMemSlicePitch = 0;
+
+	HRESULT hr = gDevice->CreateTexture2D(&texDesc, &texData, &gTexture);
+	if (FAILED(hr))
+		exit(-1);
+
+	//Resource view description
+	D3D11_SHADER_RESOURCE_VIEW_DESC resViewDesc;
+	ZeroMemory(&resViewDesc, sizeof(resViewDesc));
+	resViewDesc.Format = texDesc.Format;
+	resViewDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	resViewDesc.Texture2D.MipLevels = texDesc.MipLevels;
+	resViewDesc.Texture2D.MostDetailedMip = 0;
+
+	hr = gDevice->CreateShaderResourceView(gTexture, &resViewDesc, &gTexView);
+	if (FAILED(hr))
+		exit(-1);
+	gTexture->Release();
+
+
+	//Define sampler
+	D3D11_SAMPLER_DESC samplerDesc;
+	ZeroMemory(&samplerDesc, sizeof(samplerDesc));
+	samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+	samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+	samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
+	samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+	samplerDesc.MinLOD = 0;
+	samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
+	samplerDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+	//Create Sampler
+	hr = gDevice->CreateSamplerState(&samplerDesc, &gSamplerState);
+	if (FAILED(hr))
+		exit(-1);
+	
+
+
+	//Enable depth stencil
+	D3D11_TEXTURE2D_DESC gDepthBufferDesc;
+	ZeroMemory(&gDepthBufferDesc, sizeof(gDepthBufferDesc));
+	gDepthBufferDesc.Width = (unsigned int)WIDTH; //size of viewport, not image.
+	gDepthBufferDesc.Height = (unsigned int)HEIGHT;
+	gDepthBufferDesc.MipLevels = 1;
+	gDepthBufferDesc.ArraySize = 1;
+	gDepthBufferDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+	gDepthBufferDesc.SampleDesc.Count = 4; //Same as in Direct3DContext, otherwise creates problems
+	gDepthBufferDesc.SampleDesc.Quality = 0;
+	gDepthBufferDesc.Usage = D3D11_USAGE_DEFAULT;
+	gDepthBufferDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+	gDepthBufferDesc.CPUAccessFlags = 0;
+	gDepthBufferDesc.MiscFlags = 0;
+
+	hr = gDevice->CreateTexture2D(&gDepthBufferDesc, nullptr, &gDepthStencilBuffer);
+	if (FAILED(hr))
+		exit(-1);
+
+
+	//Create a view of the depth stencil buffer.
+	D3D11_DEPTH_STENCIL_VIEW_DESC gDepthStencilViewDesc;
+	ZeroMemory(&gDepthStencilViewDesc, sizeof(gDepthStencilViewDesc));
+	gDepthStencilViewDesc.Format = gDepthBufferDesc.Format;
+	gDepthStencilViewDesc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMS;
+
+	hr = gDevice->CreateDepthStencilView(gDepthStencilBuffer, &gDepthStencilViewDesc, &gDepthStencilView);
+	if (FAILED(hr))
+		exit(-1);
+	gDepthStencilBuffer->Release();
+	// Set render target to back buffer
+	gDeviceContext->OMSetRenderTargets(1, &gBackbufferRTV, gDepthStencilView);
+
+	D3D11_DEPTH_STENCIL_DESC gDepthStencilDesc;
+	//// Depth test parameters
+	gDepthStencilDesc.DepthEnable = true;
+	gDepthStencilDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+	gDepthStencilDesc.DepthFunc = D3D11_COMPARISON_LESS;
+	// Stencil test parameters
+	gDepthStencilDesc.StencilEnable = true;
+	gDepthStencilDesc.StencilReadMask = 0xFF;
+	gDepthStencilDesc.StencilWriteMask = 0xFF;
+	// Stencil operations if pixel is front-facing
+	gDepthStencilDesc.FrontFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
+	gDepthStencilDesc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_INCR;
+	gDepthStencilDesc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
+	gDepthStencilDesc.FrontFace.StencilFunc = D3D11_COMPARISON_ALWAYS;
+	// Stencil operations if pixel is back-facing
+	gDepthStencilDesc.BackFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
+	gDepthStencilDesc.BackFace.StencilDepthFailOp = D3D11_STENCIL_OP_DECR;
+	gDepthStencilDesc.BackFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
+	gDepthStencilDesc.BackFace.StencilFunc = D3D11_COMPARISON_ALWAYS;
+
+	// Create depth stencil state
+	ID3D11DepthStencilState * gDepthStencilState;
+	hr = gDevice->CreateDepthStencilState(&gDepthStencilDesc, &gDepthStencilState);
+	if (FAILED(hr))
+		exit(-1);
+	gDepthStencilState->Release();
+
+};
+
+void CreateQuadData() //Create vertex buffer of a quad
+{
+	//Define quad
+	TriangleVertex triangleVertices[VERTEXCOUNT] =
+	{
+		//Triangle 1
+		-0.5f, 0.5f, 0.0f,	//v0 pos
+		0.0f, 0.0f,			//v0 tex coordinates (uv)
+		0.5f, 0.5f, 0.0f,	//v1
+		1.0f, 0.0f,			//v1 tex
+		0.5f, -0.5f, 0.0f,  //v2
+		1.0f, 1.0f,			//v2 tex
+
+		//Triangle 2
+		-0.5f, 0.5f, 0.0f,	//v0 pos
+		0.0f, 0.0f,			//v0 tex
+		0.5f, -0.5f, 0.0f,	//v1 pos  
+		1.0f, 1.0f,			//v1 tex
+		-0.5f, -0.5f, 0.0f, //v2 pos
+		0.0f, 1.0f,			//v2 tex
+
+	};
+	
+
+	D3D11_BUFFER_DESC bufferDesc;
+	memset(&bufferDesc, 0, sizeof(bufferDesc));
+	bufferDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+	bufferDesc.Usage = D3D11_USAGE_DEFAULT;
+	bufferDesc.ByteWidth = sizeof(triangleVertices);
+
+	D3D11_SUBRESOURCE_DATA data;
+	data.pSysMem = triangleVertices;
+	gDevice->CreateBuffer(&bufferDesc, &data, &gVertexBuffer);
+}
+
+void CreateMatrices()
+{
+	//world
+	XMStoreFloat4x4(&wvp.world, XMMatrixTranspose(XMMatrixRotationY(0))); //Define world as a rotationmatrix of 0 rads.
+	//view
+	XMStoreFloat4x4(&wvp.view,
+		(
+			XMMatrixTranspose(XMMatrixLookAtLH(
+				CAM_POS,	//Eye Position
+				{ 0.0f, 0.0f, 0.0f, 1.0f },	//Look at position
+				{ 0.0f, 1.0f, 0.0f, 1.0f }  //Up
+			)))
+	);
+	//proj
+	XMStoreFloat4x4(&wvp.project,
+		(
+			XMMatrixTranspose(XMMatrixPerspectiveFovLH(
+				PI*0.45f,		//FOV
+				(WIDTH / HEIGHT),  //Aspect Ratio
+				0.1f,			//NearZ
+				20				//FarZ
+				)))
+	);
+
+
+}
+
+void CreateShaders()
+{
+	//Vertex shader
+	ID3DBlob* pVS = nullptr; //Make a pointer 
+	D3DCompileFromFile(
+		L"Vertex.hlsl", // filename
+		nullptr,		// optional macros
+		nullptr,		// optional include files
+		"VS_main",		// entry point
+		"vs_5_0",		// shader model (target)
+		0,				// shader compile options			
+		0,				// effect compile options
+		&pVS,			// double pointer to ID3DBlob		
+		nullptr			// pointer for Error Blob messages.
+	);
+
+	HRESULT hr = gDevice->CreateVertexShader(pVS->GetBufferPointer(), pVS->GetBufferSize(), nullptr, &gVertexShader);
+	if (FAILED(hr))
+		exit(-1);
+
+	//create input layout (verified using vertex shader)
+	D3D11_INPUT_ELEMENT_DESC inputDesc[] = {
+	{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+	{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+	};
+	hr = gDevice->CreateInputLayout(inputDesc, ARRAYSIZE(inputDesc), pVS->GetBufferPointer(), pVS->GetBufferSize(), &gVertexLayout); //Vi fortsätter
+	// Since we do not need this COM object anymore, we release it.
+	pVS->Release();
+
+	//create pixel shader
+	ID3DBlob* pPS = nullptr;
+	D3DCompileFromFile(
+		L"Fragment.hlsl", // filename
+		nullptr,		// optional macros
+		nullptr,		// optional include files
+		"PS_main",		// entry point
+		"ps_5_0",		// shader model (target)
+		0,				// shader compile options
+		0,				// effect compile options
+		&pPS,			// double pointer to ID3DBlob		
+		nullptr			// pointer for Error Blob messages.
+	);
+
+	hr = gDevice->CreatePixelShader(pPS->GetBufferPointer(), pPS->GetBufferSize(), nullptr, &gPixelShader);
+	if (FAILED(hr))
+		exit(-1);
+	pPS->Release();
+
+	ID3DBlob* pGS = nullptr;
+	D3DCompileFromFile(
+		L"GeometryShader.hlsl", // filename
+		nullptr,		// optional macros
+		nullptr,		// optional include files
+		"GS_main",		// entry point
+		"gs_5_0",		// shader model (target)
+		0,				// shader compile options
+		0,				// effect compile options
+		&pGS,				
+		nullptr			
+	);
+
+	hr = gDevice->CreateGeometryShader(pGS->GetBufferPointer(), pGS->GetBufferSize(), nullptr, &gGeometryShader);
+	if (FAILED(hr))
+		exit(-1);
+	pGS->Release();
+}
+
+void Render()
+{
+	float clearColor[] = { 0, 0, 0, 1 };
+	
+	//Clear screen and depthbuffer
+	gDeviceContext->ClearRenderTargetView(gBackbufferRTV, clearColor);
+	gDeviceContext->ClearDepthStencilView(gDepthStencilView, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+
+	UINT32 vertexSize = sizeof(TriangleVertex); //Will be the size of 5 floats, x y z u v
+	UINT32 offset = 0;
+	//Setting Shaders (HS and DS shaders removed for clarity)
+	//VertexShader
+	gDeviceContext->VSSetShader(gVertexShader, nullptr, 0);
+	gDeviceContext->IASetVertexBuffers(0, 1, &gVertexBuffer, &vertexSize, &offset);
+	gDeviceContext->IASetInputLayout(gVertexLayout);
+	gDeviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	//GeoShader
+	gDeviceContext->GSSetShader(gGeometryShader, nullptr, 0);
+	//Pixelshader + texture
+	gDeviceContext->PSSetShader(gPixelShader, nullptr, 0); 
+	gDeviceContext->PSSetShaderResources(0, 1, &gTexView); //Texture
+	gDeviceContext->PSSetSamplers(0, 1, &gSamplerState);
+
+	//Mapping CBuffer
+	D3D11_MAPPED_SUBRESOURCE dataPtr;
+	gDeviceContext->Map(gCBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &dataPtr);
+	
+	//Update for each frame
+	Spin();
+	//Update 
+	XMStoreFloat4x4(&wvp.world, XMMatrixTranspose(XMMatrixRotationY(rot)));
+	memcpy(dataPtr.pData, &wvp, sizeof(wvp));
+	//Unmap CBuffer
+	gDeviceContext->Unmap(gCBuffer, 0);
+	//Feed the constant buffer to Geometry Shader
+	gDeviceContext->GSSetConstantBuffers(0, 1, &gCBuffer);
+	// Draw geometry
+	gDeviceContext->Draw(VERTEXCOUNT, 0);
+
+}
+
+//===============================================================================
+//Helper functions
+//===============================================================================
+void ReleaseBuffers()
+{
+	gVertexBuffer->Release();
+	gVertexLayout->Release();
+	gVertexShader->Release();
+	gGeometryShader->Release();
+	gTexture->Release();
+	gTexView->Release();
+	gPixelShader->Release();
+	gBackbufferRTV->Release();
+	gSwapChain->Release();
+	gDevice->Release();
+	gDeviceContext->Release();
+}
+
+void Spin()
+{
+	rot += 0.01f;
+	rot /= 1.0f;
+}
